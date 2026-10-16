@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Fuel Route Planner</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <style>
+    :root { --bg: #fafafa; --panel: #fff; --border: #e3e3e3; --text: #111; --muted: #666; --accent: #2563eb; --error: #b00020; }
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; color: var(--text); background: var(--bg); }
+    #map { position: absolute; inset: 0 0 0 360px; }
+    aside { position: absolute; inset: 0 auto 0 0; width: 360px; overflow-y: auto; box-sizing: border-box;
+            padding: 16px; background: var(--bg); border-right: 1px solid #ddd; }
+    h1 { font-size: 18px; margin: 0 0 12px; }
+    h2 { font-size: 15px; margin: 18px 0 4px; }
+    form { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+    fieldset { border: 0; margin: 0 0 10px; padding: 0; }
+    legend { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 4px; }
+    .row { display: grid; grid-template-columns: 80px 1fr; gap: 6px; }
+    select, input { font: inherit; font-size: 14px; padding: 6px; border: 1px solid #ccc; border-radius: 6px; background: #fff; min-width: 0; }
+    label.inline { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--muted); }
+    label.inline input { width: 80px; }
+    button { width: 100%; margin-top: 10px; padding: 9px; font: inherit; font-weight: 600; color: #fff; background: var(--accent);
+             border: 0; border-radius: 6px; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: progress; }
+    .totals { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
+    .totals div { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
+    .totals b { display: block; font-size: 18px; }
+    .totals small { color: var(--muted); }
+    ol { padding-left: 20px; } li { margin-bottom: 10px; font-size: 14px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .error { color: var(--error); }
+    @media (max-width: 700px) { aside { position: static; width: auto; } #map { position: relative; inset: auto; height: 70vh; } }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>Fuel Route Planner</h1>
+    <form id="planner">
+      <fieldset>
+        <legend>Start</legend>
+        <div class="row">
+          <select id="start-state" aria-label="Start state" required>
+            <option value="">State</option>
+            {% for st in states %}<option>{{ st }}</option>{% endfor %}
+          </select>
+          <select id="start-city" aria-label="Start city" required disabled><option value="">City</option></select>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Finish</legend>
+        <div class="row">
+          <select id="finish-state" aria-label="Finish state" required>
+            <option value="">State</option>
+            {% for st in states %}<option>{{ st }}</option>{% endfor %}
+          </select>
+          <select id="finish-city" aria-label="Finish city" required disabled><option value="">City</option></select>
+        </div>
+      </fieldset>
+      <label class="inline">Cost per stop (USD, 0 = cheapest fuel only)
+        <input id="stop-cost" type="number" min="0" max="1000" step="1" placeholder="10" value="{{ stop_cost }}">
+      </label>
+      <button type="submit">Plan route</button>
+    </form>
+
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+    {% if plan %}
+      <h2>{{ plan.start.query }} → {{ plan.finish.query }}</h2>
+      <div class="totals">
+        <div><b>${{ plan.summary.total_fuel_cost }}</b><small>total fuel cost</small></div>
+        <div><b>{{ plan.summary.distance_miles }} mi</b><small>distance</small></div>
+        <div><b>{{ plan.summary.total_gallons }} gal</b><small>at {{ plan.summary.mpg|floatformat:0 }} mpg</small></div>
+        <div><b>{{ plan.summary.number_of_stops }}</b><small>fuel stops</small></div>
+      </div>
+      <ol>
+        {% for s in plan.fuel_stops %}
+          <li><b>{{ s.name }}</b><br>{{ s.address }}, {{ s.city }}, {{ s.state }}<br>
+            mile {{ s.mile_marker }} · ${{ s.price_per_gallon }}/gal · {{ s.gallons }} gal = <b>${{ s.cost }}</b></li>
+        {% endfor %}
+      </ol>
+      <p class="muted">Range {{ plan.summary.vehicle_range_miles|floatformat:0 }} mi · tank starts empty ·
+        ${{ plan.summary.stop_cost_usd|floatformat:0 }} per stop ·
+        {{ plan.summary.stations_considered }} stations near the route considered ·
+        {{ plan.meta.routing_api_calls }} routing API call(s) · {{ plan.meta.compute_ms }} ms</p>
+    {% endif %}
+  </aside>
+  <div id="map"></div>
+
+  {% if plan %}{{ geojson|json_script:"route-data" }}{{ plan.start.query|json_script:"start-query" }}{{ plan.finish.query|json_script:"finish-query" }}{% endif %}
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script>
+    const map = L.map("map").setView([39.8, -98.6], 4);
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 19,
+      attribution: "Tiles &copy; Esri &mdash; Sources: Esri, HERE, Garmin, USGS, OpenStreetMap contributors",
+    }).addTo(map);
+
+    const dataEl = document.getElementById("route-data");
+    if (dataEl) {
+      const layer = L.geoJSON(JSON.parse(dataEl.textContent), {
+        style: { color: "#2563eb", weight: 4 },
+        pointToLayer: (f, latlng) => {
+          const p = f.properties;
+          if (p.kind === "fuel_stop") {
+            return L.circleMarker(latlng, { radius: 9, color: "#fff", weight: 2, fillColor: "#16a34a", fillOpacity: 1 })
+              .bindTooltip(String(p.stop), { permanent: true, direction: "center" })
+              .bindPopup(`<b>#${p.stop} ${p.name}</b><br>${p.city}, ${p.state}<br>$${p.price_per_gallon}/gal · ${p.gallons} gal · $${p.cost}`);
+          }
+          return L.circleMarker(latlng, { radius: 8, color: "#fff", weight: 2, fillColor: p.kind === "start" ? "#111" : "#dc2626", fillOpacity: 1 })
+            .bindPopup(`<b>${p.kind}</b>: ${p.name}`);
+        },
+      }).addTo(map);
+      map.fitBounds(layer.getBounds(), { padding: [20, 20] });
+    }
+
+    const citiesUrl = "{% url 'cities' %}";
+    const cache = {};
+    async function loadCities(side, selected) {
+      const state = document.getElementById(`${side}-state`).value;
+      const citySelect = document.getElementById(`${side}-city`);
+      citySelect.replaceChildren(new Option(state ? "Loading…" : "City", ""));
+      citySelect.disabled = true;
+      if (!state) return;
+      try {
+        cache[state] ??= (await (await fetch(`${citiesUrl}?state=${state}`)).json()).cities;
+      } catch {
+        citySelect.replaceChildren(new Option("Could not load cities", ""));
+        return;
+      }
+      citySelect.replaceChildren(new Option(`City (${cache[state].length})`, ""), ...cache[state].map((c) => new Option(c, c)));
+      citySelect.disabled = false;
+      if (selected) citySelect.value = selected;
+    }
+
+    for (const side of ["start", "finish"]) {
+      document.getElementById(`${side}-state`).addEventListener("change", () => loadCities(side));
+      const queryEl = document.getElementById(`${side}-query`);
+      const match = queryEl && JSON.parse(queryEl.textContent).match(/^(.*),\s*([A-Za-z]{2})$/);
+      if (match) {
+        document.getElementById(`${side}-state`).value = match[2].toUpperCase();
+        loadCities(side, match[1].trim());
+      }
+    }
+
+    document.getElementById("planner").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const value = (id) => document.getElementById(id).value;
+      const params = new URLSearchParams({
+        start: `${value("start-city")}, ${value("start-state")}`,
+        finish: `${value("finish-city")}, ${value("finish-state")}`,
+      });
+      if (value("stop-cost") !== "") params.set("stop_cost", value("stop-cost"));
+      event.submitter.disabled = true;
+      event.submitter.textContent = "Planning…";
+      window.location.search = params.toString();
+    });
+  </script>
+</body>
+</html>
